@@ -1,59 +1,133 @@
 import os
 import logging
-from datetime import datetime
-from pymongo import MongoClient
+import sqlite3
+import datetime
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
-# Setup logging
+# Enable logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Environment variables
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-MONGODB_URI = os.environ.get("MONGODB_URI")
-ADMIN_IDS = [int(admin.strip()) for admin in os.environ.get("ADMIN_IDS", "").split(",") if admin.strip()]
+# Get the bot token from environment variable
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+DATABASE_PATH = "file_storage.db"
+INITIAL_ADMIN_ID = int(os.environ.get("INITIAL_ADMIN_ID", "0"))  # Set your Telegram user ID as default admin
 
-# MongoDB setup
-client = MongoClient(MONGODB_URI)
-db = client["file_sharing_bot"]
-files_collection = db["files"]
-stats_collection = db["stats"]
+# Create a connection to the SQLite database
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-# Initialize stats if not exists
-if stats_collection.count_documents({}) == 0:
-    stats_collection.insert_one({
-        "total_files": 0,
-        "total_downloads": 0,
-        "total_users": 0,
-        "last_updated": datetime.now()
-    })
+# Initialize the database
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Create files table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id TEXT NOT NULL,
+        file_name TEXT NOT NULL,
+        description TEXT,
+        uploaded_by INTEGER NOT NULL,
+        upload_date TEXT NOT NULL,
+        mime_type TEXT,
+        file_size INTEGER
+    )
+    ''')
+    
+    # Create tags table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS tags (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id INTEGER NOT NULL,
+        tag TEXT NOT NULL,
+        FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
+    )
+    ''')
+    
+    # Create admins table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS admins (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL UNIQUE,
+        added_on TEXT NOT NULL
+    )
+    ''')
+    
+    # Create stats table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS stats (
+        id INTEGER PRIMARY KEY,
+        total_files INTEGER DEFAULT 0,
+        total_downloads INTEGER DEFAULT 0,
+        total_searches INTEGER DEFAULT 0,
+        last_updated TEXT
+    )
+    ''')
+    
+    # Insert initial admin if not exists
+    if INITIAL_ADMIN_ID != 0:
+        cursor.execute('''
+        INSERT OR IGNORE INTO admins (user_id, added_on)
+        VALUES (?, ?)
+        ''', (INITIAL_ADMIN_ID, datetime.datetime.now().isoformat()))
+    
+    # Initialize stats if not exists
+    cursor.execute('''
+    INSERT OR IGNORE INTO stats (id, total_files, total_downloads, total_searches, last_updated)
+    VALUES (1, 0, 0, 0, ?)
+    ''', (datetime.datetime.now().isoformat(),))
+    
+    conn.commit()
+    conn.close()
 
-# Helper functions
-async def is_admin(update: Update) -> bool:
-    """Check if the user is an admin"""
-    user_id = update.effective_user.id
-    admins_list = ADMIN_IDS + [admin_id for admin in db["admins"].find()]
-    return user_id in admins_list
+# Check if user is admin
+async def is_admin(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    admin = cursor.execute('SELECT * FROM admins WHERE user_id = ?', (user_id,)).fetchone()
+    conn.close()
+    return admin is not None
 
-async def get_file_info(file_id: str) -> dict:
-    """Get file information from database"""
-    return files_collection.find_one({"file_id": file_id})
+# Admin-only decorator
+def admin_only(func):
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.effective_user.id
+        if await is_admin(user_id):
+            return await func(update, context, *args, **kwargs)
+        else:
+            await update.message.reply_text("Sorry, this command is for admins only.")
+            return None
+    return wrapped
 
-async def update_stats(field: str):
-    """Update bot statistics"""
-    stats_collection.update_one({}, {"$inc": {field: 1}, "$set": {"last_updated": datetime.now()}})
+# Update stats
+async def update_stats(stat_type):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    if stat_type == "files":
+        cursor.execute('UPDATE stats SET total_files = total_files + 1, last_updated = ? WHERE id = 1', 
+                     (datetime.datetime.now().isoformat(),))
+    elif stat_type == "downloads":
+        cursor.execute('UPDATE stats SET total_downloads = total_downloads + 1, last_updated = ? WHERE id = 1',
+                     (datetime.datetime.now().isoformat(),))
+    elif stat_type == "searches":
+        cursor.execute('UPDATE stats SET total_searches = total_searches + 1, last_updated = ? WHERE id = 1',
+                     (datetime.datetime.now().isoformat(),))
+    
+    conn.commit()
+    conn.close()
 
 # Command handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send welcome message when the command /start is issued."""
-    welcome_message = (
-        "🤖 *Welcome to File Sharing Bot* 🤖\n\n"
-        "This bot allows administrators to upload and manage files.\n\n"
-        "Available commands:\n"
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    commands = (
         "📤 Upload any file to store it\n"
         "🔍 /search <keyword> - Search for files\n"
         "📊 /stats - View bot statistics\n"
@@ -66,497 +140,473 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "👤 /removeadmin <user_id> - Remove admin\n"
         "👥 /listadmins - List all admins\n"
         "🗑️ /deletefile <file_id> - Delete a file\n"
-        "ⓘ /info <file_id> - Get file information"
+        "ⓘ /info <file_id> - Get file information\n"
     )
-    await update.message.reply_text(welcome_message, parse_mode="Markdown")
     
-    # Update user stats
-    if not db["users"].find_one({"user_id": update.effective_user.id}):
-        db["users"].insert_one({
-            "user_id": update.effective_user.id,
-            "username": update.effective_user.username,
-            "first_name": update.effective_user.first_name,
-            "last_name": update.effective_user.last_name,
-            "joined_date": datetime.now()
-        })
-        await update_stats("total_users")
+    await update.message.reply_text(
+        f"Welcome to the File Sharing Bot!\n\n"
+        f"Admin Commands:\n{commands}\n\n"
+        f"Note: All commands can only be used by admins."
+    )
 
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle file uploads"""
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ Only admins can upload files.")
-        return
-    
+@admin_only
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle file uploads from admins."""
     file = None
-    file_type = None
+    file_name = "unknown"
+    mime_type = "unknown"
+    file_size = 0
     
+    # Check which type of file it is
     if update.message.document:
         file = update.message.document
-        file_type = "document"
+        file_name = file.file_name
+        mime_type = file.mime_type
+        file_size = file.file_size
     elif update.message.photo:
         file = update.message.photo[-1]  # Get the largest photo
-        file_type = "photo"
+        file_name = f"photo_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        mime_type = "image/jpeg"
+        file_size = file.file_size
     elif update.message.video:
         file = update.message.video
-        file_type = "video"
+        file_name = file.file_name or f"video_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+        mime_type = file.mime_type
+        file_size = file.file_size
     elif update.message.audio:
         file = update.message.audio
-        file_type = "audio"
+        file_name = file.file_name or f"audio_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.mp3"
+        mime_type = file.mime_type
+        file_size = file.file_size
+    elif update.message.voice:
+        file = update.message.voice
+        file_name = f"voice_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.ogg"
+        mime_type = file.mime_type
+        file_size = file.file_size
     
     if file:
-        # Extract caption or default to file name
-        caption = update.message.caption or ""
-        file_name = file.file_name if hasattr(file, 'file_name') else f"{file_type}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        # Save file info to database
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        INSERT INTO files (file_id, file_name, description, uploaded_by, upload_date, mime_type, file_size)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            file.file_id,
+            file_name,
+            update.message.caption or "No description",
+            update.effective_user.id,
+            datetime.datetime.now().isoformat(),
+            mime_type,
+            file_size
+        ))
+        file_db_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
         
-        # Extract tags from caption if present
-        tags = []
-        if "#" in caption:
-            words = caption.split()
-            tags = [word.strip("#") for word in words if word.startswith("#")]
-            
-        # Store file in database
-        file_data = {
-            "file_id": file.file_id,
-            "file_name": file_name,
-            "file_type": file_type,
-            "description": caption,
-            "tags": tags,
-            "uploaded_by": update.effective_user.id,
-            "upload_date": datetime.now(),
-            "download_count": 0
-        }
+        # Update stats
+        await update_stats("files")
         
-        files_collection.insert_one(file_data)
-        await update_stats("total_files")
-        
+        # Notify uploader
         await update.message.reply_text(
-            f"✅ File uploaded successfully!\n"
-            f"File ID: `{file.file_id}`\n"
-            f"Name: {file_name}\n"
-            f"Type: {file_type}\n"
-            f"Tags: {', '.join(tags) if tags else 'None'}",
-            parse_mode="Markdown"
+            f"File uploaded successfully!\n"
+            f"File ID: {file_db_id}\n"
+            f"File Name: {file_name}\n"
+            f"Size: {file_size / 1024 / 1024:.2f} MB"
         )
     else:
-        await update.message.reply_text("❌ No file detected. Please upload a file.")
+        await update.message.reply_text("No file detected. Please send a file to upload.")
 
-async def search_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Search files by keyword"""
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ Only admins can search files.")
-        return
-        
+@admin_only
+async def search_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search for files by keyword."""
     if not context.args:
-        await update.message.reply_text("❌ Please provide a search term: /search <keyword>")
+        await update.message.reply_text("Please provide a search keyword.\nUsage: /search <keyword>")
         return
-        
-    keyword = " ".join(context.args).lower()
     
-    # Search in file names, descriptions and tags
-    query = {
-        "$or": [
-            {"file_name": {"$regex": keyword, "$options": "i"}},
-            {"description": {"$regex": keyword, "$options": "i"}},
-            {"tags": {"$in": [keyword]}}
-        ]
-    }
+    keyword = ' '.join(context.args)
     
-    results = list(files_collection.find(query).limit(10))
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    if not results:
-        await update.message.reply_text(f"❌ No files found matching '{keyword}'")
+    # Search in file names, descriptions, and tags
+    cursor.execute('''
+    SELECT DISTINCT f.id, f.file_name, f.description, f.mime_type, f.file_size, f.upload_date 
+    FROM files f
+    LEFT JOIN tags t ON f.id = t.file_id
+    WHERE f.file_name LIKE ? OR f.description LIKE ? OR t.tag LIKE ?
+    LIMIT 10
+    ''', (f'%{keyword}%', f'%{keyword}%', f'%{keyword}%'))
+    
+    files = cursor.fetchall()
+    conn.close()
+    
+    # Update stats
+    await update_stats("searches")
+    
+    if not files:
+        await update.message.reply_text(f"No files found matching '{keyword}'.")
         return
-        
-    response = f"🔍 Found {len(results)} files matching '{keyword}':\n\n"
     
-    for idx, file in enumerate(results, 1):
-        response += (
-            f"{idx}. *{file['file_name']}*\n"
-            f"   ID: `{file['file_id']}`\n"
-            f"   Type: {file['file_type']}\n"
-            f"   Tags: {', '.join(file['tags']) if file['tags'] else 'None'}\n\n"
-        )
+    result = f"🔍 Search results for '{keyword}':\n\n"
+    for file in files:
+        result += f"ID: {file['id']}\n"
+        result += f"📄 {file['file_name']}\n"
+        result += f"📝 {file['description'][:50]}...\n"
+        result += f"📅 {file['upload_date'][:10]}\n"
+        result += f"💾 {file['file_size'] / 1024 / 1024:.2f} MB\n\n"
     
-    await update.message.reply_text(response, parse_mode="Markdown")
+    await update.message.reply_text(result)
 
-async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Display bot statistics"""
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ Only admins can view statistics.")
-        return
-        
-    stats = stats_collection.find_one({})
+@admin_only
+async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get bot statistics."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    stats = cursor.execute('SELECT * FROM stats WHERE id = 1').fetchone()
     
-    if not stats:
-        await update.message.reply_text("❌ Statistics not available.")
-        return
-        
-    response = (
-        "📊 *Bot Statistics*\n\n"
+    # Count total admins
+    total_admins = cursor.execute('SELECT COUNT(*) as count FROM admins').fetchone()['count']
+    
+    # Count total space used
+    total_size = cursor.execute('SELECT SUM(file_size) as total FROM files').fetchone()['total'] or 0
+    
+    conn.close()
+    
+    await update.message.reply_text(
+        f"📊 Bot Statistics 📊\n\n"
         f"Total Files: {stats['total_files']}\n"
         f"Total Downloads: {stats['total_downloads']}\n"
-        f"Total Users: {stats['total_users']}\n"
-        f"Last Updated: {stats['last_updated'].strftime('%Y-%m-%d %H:%M:%S')}"
+        f"Total Searches: {stats['total_searches']}\n"
+        f"Total Admins: {total_admins}\n"
+        f"Total Storage Used: {total_size / 1024 / 1024 / 1024:.2f} GB\n"
+        f"Last Updated: {stats['last_updated'][:19]}"
     )
-    
-    await update.message.reply_text(response, parse_mode="Markdown")
 
-async def get_file_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Generate shareable link for a file"""
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ Only admins can generate file links.")
+@admin_only
+async def get_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get a shareable link for a file."""
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Please provide a valid file ID.\nUsage: /link <file_id>")
         return
-        
-    if not context.args:
-        await update.message.reply_text("❌ Please provide a file ID: /link <file_id>")
-        return
-        
-    file_id = context.args[0]
-    file = await get_file_info(file_id)
+    
+    file_id = int(context.args[0])
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    file = cursor.execute('SELECT * FROM files WHERE id = ?', (file_id,)).fetchone()
+    conn.close()
     
     if not file:
-        await update.message.reply_text(f"❌ No file found with ID: {file_id}")
+        await update.message.reply_text(f"File with ID {file_id} not found.")
         return
-        
+    
     # Create a shareable link
-    bot_username = context.bot.username
+    bot_username = (await context.bot.get_me()).username
     link = f"https://t.me/{bot_username}?start=file_{file_id}"
     
     await update.message.reply_text(
-        f"🔗 *Shareable Link*\n\n"
-        f"File: {file['file_name']}\n"
-        f"Link: {link}",
-        parse_mode="Markdown"
+        f"🔗 Shareable link for '{file['file_name']}':\n{link}"
     )
 
-async def edit_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Edit file description"""
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ Only admins can edit file descriptions.")
-        return
-        
+@admin_only
+async def edit_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Edit file description."""
     if len(context.args) < 2:
-        await update.message.reply_text("❌ Please provide file ID and new description: /editdesc <file_id> <description>")
+        await update.message.reply_text("Please provide a file ID and new description.\nUsage: /editdesc <file_id> <description>")
         return
-        
+    
     file_id = context.args[0]
-    new_description = " ".join(context.args[1:])
-    
-    result = files_collection.update_one(
-        {"file_id": file_id},
-        {"$set": {"description": new_description}}
-    )
-    
-    if result.modified_count > 0:
-        await update.message.reply_text(f"✅ Description updated for file ID: {file_id}")
-    else:
-        await update.message.reply_text(f"❌ No file found with ID: {file_id}")
-
-async def edit_filename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Edit file name"""
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ Only admins can edit file names.")
+    if not file_id.isdigit():
+        await update.message.reply_text("Please provide a valid numeric file ID.")
         return
-        
+    
+    file_id = int(file_id)
+    new_desc = ' '.join(context.args[1:])
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('UPDATE files SET description = ? WHERE id = ?', (new_desc, file_id))
+    affected_rows = conn.total_changes
+    conn.commit()
+    conn.close()
+    
+    if affected_rows > 0:
+        await update.message.reply_text(f"Description updated for file ID {file_id}.")
+    else:
+        await update.message.reply_text(f"File with ID {file_id} not found.")
+
+@admin_only
+async def edit_filename(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Edit file name."""
     if len(context.args) < 2:
-        await update.message.reply_text("❌ Please provide file ID and new name: /editname <file_id> <new_name>")
+        await update.message.reply_text("Please provide a file ID and new name.\nUsage: /editname <file_id> <new_name>")
         return
-        
+    
     file_id = context.args[0]
-    new_name = " ".join(context.args[1:])
-    
-    result = files_collection.update_one(
-        {"file_id": file_id},
-        {"$set": {"file_name": new_name}}
-    )
-    
-    if result.modified_count > 0:
-        await update.message.reply_text(f"✅ File name updated for file ID: {file_id}")
-    else:
-        await update.message.reply_text(f"❌ No file found with ID: {file_id}")
-
-async def add_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Add tag to a file"""
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ Only admins can add tags.")
+    if not file_id.isdigit():
+        await update.message.reply_text("Please provide a valid numeric file ID.")
         return
-        
+    
+    file_id = int(file_id)
+    new_name = ' '.join(context.args[1:])
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('UPDATE files SET file_name = ? WHERE id = ?', (new_name, file_id))
+    affected_rows = conn.total_changes
+    conn.commit()
+    conn.close()
+    
+    if affected_rows > 0:
+        await update.message.reply_text(f"File name updated for file ID {file_id}.")
+    else:
+        await update.message.reply_text(f"File with ID {file_id} not found.")
+
+@admin_only
+async def add_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add tag to a file."""
     if len(context.args) < 2:
-        await update.message.reply_text("❌ Please provide file ID and tag: /addtag <file_id> <tag>")
+        await update.message.reply_text("Please provide a file ID and tag.\nUsage: /addtag <file_id> <tag>")
         return
-        
+    
     file_id = context.args[0]
-    tag = context.args[1].lower()
-    
-    result = files_collection.update_one(
-        {"file_id": file_id},
-        {"$addToSet": {"tags": tag}}
-    )
-    
-    if result.modified_count > 0:
-        await update.message.reply_text(f"✅ Tag '{tag}' added to file ID: {file_id}")
-    else:
-        file = await get_file_info(file_id)
-        if file:
-            if tag in file.get("tags", []):
-                await update.message.reply_text(f"ℹ️ Tag '{tag}' already exists for this file.")
-            else:
-                await update.message.reply_text(f"❌ Failed to add tag. Please try again.")
-        else:
-            await update.message.reply_text(f"❌ No file found with ID: {file_id}")
-
-async def remove_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove tag from a file"""
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ Only admins can remove tags.")
+    if not file_id.isdigit():
+        await update.message.reply_text("Please provide a valid numeric file ID.")
         return
-        
+    
+    file_id = int(file_id)
+    tag = ' '.join(context.args[1:])
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Check if file exists
+    file = cursor.execute('SELECT * FROM files WHERE id = ?', (file_id,)).fetchone()
+    if not file:
+        conn.close()
+        await update.message.reply_text(f"File with ID {file_id} not found.")
+        return
+    
+    # Add tag
+    cursor.execute('INSERT INTO tags (file_id, tag) VALUES (?, ?)', (file_id, tag))
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(f"Tag '{tag}' added to file ID {file_id}.")
+
+@admin_only
+async def remove_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove tag from a file."""
     if len(context.args) < 2:
-        await update.message.reply_text("❌ Please provide file ID and tag: /removetag <file_id> <tag>")
+        await update.message.reply_text("Please provide a file ID and tag.\nUsage: /removetag <file_id> <tag>")
         return
-        
+    
     file_id = context.args[0]
-    tag = context.args[1].lower()
+    if not file_id.isdigit():
+        await update.message.reply_text("Please provide a valid numeric file ID.")
+        return
     
-    result = files_collection.update_one(
-        {"file_id": file_id},
-        {"$pull": {"tags": tag}}
-    )
+    file_id = int(file_id)
+    tag = ' '.join(context.args[1:])
     
-    if result.modified_count > 0:
-        await update.message.reply_text(f"✅ Tag '{tag}' removed from file ID: {file_id}")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM tags WHERE file_id = ? AND tag = ?', (file_id, tag))
+    affected_rows = conn.total_changes
+    conn.commit()
+    conn.close()
+    
+    if affected_rows > 0:
+        await update.message.reply_text(f"Tag '{tag}' removed from file ID {file_id}.")
     else:
-        file = await get_file_info(file_id)
-        if file:
-            if tag not in file.get("tags", []):
-                await update.message.reply_text(f"ℹ️ Tag '{tag}' does not exist for this file.")
-            else:
-                await update.message.reply_text(f"❌ Failed to remove tag. Please try again.")
-        else:
-            await update.message.reply_text(f"❌ No file found with ID: {file_id}")
+        await update.message.reply_text(f"Tag '{tag}' not found for file ID {file_id}.")
 
-async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Add a new admin"""
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ Only admins can add other admins.")
+@admin_only
+async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a new admin."""
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Please provide a valid user ID.\nUsage: /addadmin <user_id>")
         return
-        
-    if not context.args:
-        await update.message.reply_text("❌ Please provide a user ID: /addadmin <user_id>")
-        return
-        
+    
+    new_admin_id = int(context.args[0])
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
     try:
-        new_admin_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ User ID must be a number.")
-        return
-        
-    # Check if user is already an admin
-    if new_admin_id in ADMIN_IDS or db["admins"].find_one({"user_id": new_admin_id}):
-        await update.message.reply_text("ℹ️ This user is already an admin.")
-        return
-        
-    db["admins"].insert_one({"user_id": new_admin_id, "added_by": update.effective_user.id, "added_date": datetime.now()})
-    await update.message.reply_text(f"✅ User {new_admin_id} added as admin.")
+        cursor.execute('INSERT INTO admins (user_id, added_on) VALUES (?, ?)', 
+                     (new_admin_id, datetime.datetime.now().isoformat()))
+        conn.commit()
+        await update.message.reply_text(f"User {new_admin_id} added as admin.")
+    except sqlite3.IntegrityError:
+        await update.message.reply_text(f"User {new_admin_id} is already an admin.")
+    finally:
+        conn.close()
 
-async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove an admin"""
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ Only admins can remove other admins.")
+@admin_only
+async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove an admin."""
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Please provide a valid user ID.\nUsage: /removeadmin <user_id>")
         return
-        
-    if not context.args:
-        await update.message.reply_text("❌ Please provide a user ID: /removeadmin <user_id>")
-        return
-        
-    try:
-        admin_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ User ID must be a number.")
-        return
-        
-    # Check if user is in environment variables (can't be removed)
-    if admin_id in ADMIN_IDS:
-        await update.message.reply_text("❌ Cannot remove default admins set in environment variables.")
-        return
-        
-    result = db["admins"].delete_one({"user_id": admin_id})
     
-    if result.deleted_count > 0:
-        await update.message.reply_text(f"✅ User {admin_id} removed from admins.")
+    admin_id = int(context.args[0])
+    
+    # Don't allow removing the initial admin
+    if admin_id == INITIAL_ADMIN_ID:
+        await update.message.reply_text("Cannot remove the initial admin.")
+        return
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM admins WHERE user_id = ?', (admin_id,))
+    affected_rows = conn.total_changes
+    conn.commit()
+    conn.close()
+    
+    if affected_rows > 0:
+        await update.message.reply_text(f"Admin {admin_id} has been removed.")
     else:
-        await update.message.reply_text(f"❌ User {admin_id} is not an admin.")
+        await update.message.reply_text(f"User {admin_id} is not an admin.")
 
-async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List all admins"""
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ Only admins can view admin list.")
+@admin_only
+async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all admins."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    admins = cursor.execute('SELECT user_id, added_on FROM admins ORDER BY id').fetchall()
+    conn.close()
+    
+    if not admins:
+        await update.message.reply_text("No admins found.")
         return
-        
-    response = "👥 *Admin List*\n\n"
     
-    # Add default admins from environment variables
-    for admin_id in ADMIN_IDS:
-        response += f"• {admin_id} (Default)\n"
+    result = "👥 Admin List:\n\n"
+    for admin in admins:
+        result += f"👤 ID: {admin['user_id']}\n"
+        result += f"📅 Added: {admin['added_on'][:10]}\n"
+        result += "------------------------\n"
     
-    # Add admins from database
-    db_admins = list(db["admins"].find())
-    for admin in db_admins:
-        response += f"• {admin['user_id']} (Added on {admin['added_date'].strftime('%Y-%m-%d')})\n"
-    
-    if not ADMIN_IDS and not db_admins:
-        response += "No admins found."
-    
-    await update.message.reply_text(response, parse_mode="Markdown")
+    await update.message.reply_text(result)
 
-async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Delete a file"""
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ Only admins can delete files.")
+@admin_only
+async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete a file."""
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Please provide a valid file ID.\nUsage: /deletefile <file_id>")
         return
-        
-    if not context.args:
-        await update.message.reply_text("❌ Please provide a file ID: /deletefile <file_id>")
-        return
-        
-    file_id = context.args[0]
-    file = await get_file_info(file_id)
+    
+    file_id = int(context.args[0])
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # First get the file info for confirmation
+    file = cursor.execute('SELECT * FROM files WHERE id = ?', (file_id,)).fetchone()
     
     if not file:
-        await update.message.reply_text(f"❌ No file found with ID: {file_id}")
+        conn.close()
+        await update.message.reply_text(f"File with ID {file_id} not found.")
         return
     
-    # Create confirmation keyboard
+    # Delete the file
+    cursor.execute('DELETE FROM files WHERE id = ?', (file_id,))
+    # Tags will be deleted automatically due to ON DELETE CASCADE
+    
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(
+        f"File deleted successfully:\n"
+        f"ID: {file_id}\n"
+        f"Name: {file['file_name']}"
+    )
+
+@admin_only
+async def get_file_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get file information."""
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Please provide a valid file ID.\nUsage: /info <file_id>")
+        return
+    
+    file_id = int(context.args[0])
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Get file info
+    file = cursor.execute('SELECT * FROM files WHERE id = ?', (file_id,)).fetchone()
+    
+    if not file:
+        conn.close()
+        await update.message.reply_text(f"File with ID {file_id} not found.")
+        return
+    
+    # Get tags
+    tags = cursor.execute('SELECT tag FROM tags WHERE file_id = ?', (file_id,)).fetchall()
+    tag_list = [tag['tag'] for tag in tags]
+    
+    conn.close()
+    
+    # Send file info
+    info_text = (
+        f"ⓘ File Information\n\n"
+        f"ID: {file['id']}\n"
+        f"Name: {file['file_name']}\n"
+        f"Description: {file['description']}\n"
+        f"Size: {file['file_size'] / 1024 / 1024:.2f} MB\n"
+        f"Type: {file['mime_type']}\n"
+        f"Uploaded by: {file['uploaded_by']}\n"
+        f"Upload date: {file['upload_date'][:19]}\n"
+        f"Tags: {', '.join(tag_list) if tag_list else 'No tags'}"
+    )
+    
+    # Create keyboard with download button
     keyboard = [
-        [
-            InlineKeyboardButton("✅ Yes, delete", callback_data=f"delete_yes_{file_id}"),
-            InlineKeyboardButton("❌ No, cancel", callback_data=f"delete_no_{file_id}")
-        ]
+        [InlineKeyboardButton("Download File", callback_data=f"download_{file['file_id']}")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(
-        f"⚠️ Are you sure you want to delete this file?\n\n"
-        f"File: {file['file_name']}\n"
-        f"Type: {file['file_type']}\n"
-        f"ID: {file_id}",
-        reply_markup=reply_markup
-    )
+    await update.message.reply_text(info_text, reply_markup=reply_markup)
 
-async def file_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Get file information"""
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ Only admins can view file information.")
-        return
-        
-    if not context.args:
-        await update.message.reply_text("❌ Please provide a file ID: /info <file_id>")
-        return
-        
-    file_id = context.args[0]
-    file = await get_file_info(file_id)
-    
-    if not file:
-        await update.message.reply_text(f"❌ No file found with ID: {file_id}")
-        return
-        
-    response = (
-        "ⓘ *File Information*\n\n"
-        f"Name: {file['file_name']}\n"
-        f"Type: {file['file_type']}\n"
-        f"ID: `{file_id}`\n"
-        f"Description: {file['description'] or 'None'}\n"
-        f"Tags: {', '.join(file['tags']) if file['tags'] else 'None'}\n"
-        f"Uploaded by: {file['uploaded_by']}\n"
-        f"Upload date: {file['upload_date'].strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"Downloads: {file['download_count']}"
-    )
-    
-    # Send message with file info and download button
-    keyboard = [[InlineKeyboardButton("📥 Download File", callback_data=f"download_{file_id}")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(response, parse_mode="Markdown", reply_markup=reply_markup)
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle callback queries from inline keyboards"""
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle button callbacks."""
     query = update.callback_query
     await query.answer()
     
-    if not await is_admin(update):
-        await query.edit_message_text("⚠️ Only admins can perform this action.")
-        return
-    
+    # Parse callback data
     data = query.data
     
-    if data.startswith("delete_yes_"):
-        file_id = data.replace("delete_yes_", "")
-        file = await get_file_info(file_id)
+    if data.startswith("download_"):
+        telegram_file_id = data.split("_")[1]
         
-        if file:
-            files_collection.delete_one({"file_id": file_id})
-            await query.edit_message_text(f"✅ File '{file['file_name']}' has been deleted.")
-            stats_collection.update_one({}, {"$inc": {"total_files": -1}})
-        else:
-            await query.edit_message_text("❌ File not found or already deleted.")
-            
-    elif data.startswith("delete_no_"):
-        file_id = data.replace("delete_no_", "")
-        await query.edit_message_text("❌ File deletion cancelled.")
+        # Update download stats
+        await update_stats("downloads")
         
-    elif data.startswith("download_"):
-        file_id = data.replace("download_", "")
-        file = await get_file_info(file_id)
-        
-        if file:
-            # Update download count
-            files_collection.update_one({"file_id": file_id}, {"$inc": {"download_count": 1}})
-            await update_stats("total_downloads")
-            
+        try:
             # Send the file
-            try:
-                if file["file_type"] == "document":
-                    await context.bot.send_document(
-                        update.effective_chat.id,
-                        file["file_id"],
-                        caption=file["description"] or None
-                    )
-                elif file["file_type"] == "photo":
-                    await context.bot.send_photo(
-                        update.effective_chat.id,
-                        file["file_id"],
-                        caption=file["description"] or None
-                    )
-                elif file["file_type"] == "video":
-                    await context.bot.send_video(
-                        update.effective_chat.id,
-                        file["file_id"],
-                        caption=file["description"] or None
-                    )
-                elif file["file_type"] == "audio":
-                    await context.bot.send_audio(
-                        update.effective_chat.id,
-                        file["file_id"],
-                        caption=file["description"] or None
-                    )
-                
-                await query.edit_message_text(f"✅ File '{file['file_name']}' sent successfully.")
-            except Exception as e:
-                logger.error(f"Error sending file: {e}")
-                await query.edit_message_text(f"❌ Error sending file: {str(e)}")
-        else:
-            await query.edit_message_text("❌ File not found.")
+            await context.bot.send_document(
+                chat_id=query.message.chat_id,
+                document=telegram_file_id,
+                caption="Here's your requested file."
+            )
+        except Exception as e:
+            logger.error(f"Error sending file: {e}")
+            await query.message.reply_text(f"Error sending file: {str(e)}")
 
-def main() -> None:
-    """Start the bot"""
+def main():
+    """Start the bot."""
     # Create the Application
     application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Register command handlers
+
+    # Initialize database
+    init_db()
+
+    # Add command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("search", search_files))
     application.add_handler(CommandHandler("stats", get_stats))
-    application.add_handler(CommandHandler("link", get_file_link))
+    application.add_handler(CommandHandler("link", get_link))
     application.add_handler(CommandHandler("editdesc", edit_description))
     application.add_handler(CommandHandler("editname", edit_filename))
     application.add_handler(CommandHandler("addtag", add_tag))
@@ -565,19 +615,19 @@ def main() -> None:
     application.add_handler(CommandHandler("removeadmin", remove_admin))
     application.add_handler(CommandHandler("listadmins", list_admins))
     application.add_handler(CommandHandler("deletefile", delete_file))
-    application.add_handler(CommandHandler("info", file_info))
+    application.add_handler(CommandHandler("info", get_file_info))
     
-    # Handle file uploads
+    # Add file handler for admins
     application.add_handler(MessageHandler(
-        filters.PHOTO | filters.DOCUMENT | filters.VIDEO | filters.AUDIO, 
+        filters.ATTACHMENT & ~filters.COMMAND,
         handle_file
     ))
     
-    # Handle callback queries
-    application.add_handler(CallbackQueryHandler(handle_callback))
-    
+    # Add callback query handler for buttons
+    application.add_handler(CallbackQueryHandler(button_callback))
+
     # Start the Bot
     application.run_polling()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
